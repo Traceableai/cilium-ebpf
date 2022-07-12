@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"github.com/cilium/ebpf/internal"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -33,7 +34,7 @@ type probeType uint8
 type probeArgs struct {
 	symbol, group, path          string
 	offset, refCtrOffset, cookie uint64
-	pid                          int
+	pid, maxActive               int
 	ret                          bool
 }
 
@@ -49,6 +50,8 @@ type KprobeOptions struct {
 	// Can be used to insert kprobes at arbitrary offsets in kernel functions,
 	// e.g. in places where functions have been inlined.
 	Offset uint64
+	// MaxActive for return probes
+	MaxActive int
 }
 
 const (
@@ -191,23 +194,26 @@ func kprobe(symbol string, prog *ebpf.Program, opts *KprobeOptions, ret bool) (*
 		args.cookie = opts.Cookie
 		args.offset = opts.Offset
 	}
-
-	// Use kprobe PMU if the kernel has it available.
-	tp, err := pmuKprobe(args)
-	if errors.Is(err, os.ErrNotExist) {
-		args.symbol = platformPrefix(symbol)
-		tp, err = pmuKprobe(args)
-	}
-	if err == nil {
-		return tp, nil
-	}
-	if err != nil && !errors.Is(err, ErrNotSupported) {
-		return nil, fmt.Errorf("creating perf_kprobe PMU: %w", err)
+	if shouldAttachToPmuProbe(ret, opts) {
+		// Use kprobe PMU if the kernel has it available.
+		tp, err := pmuKprobe(args)
+		if errors.Is(err, os.ErrNotExist) {
+			args.symbol = platformPrefix(symbol)
+			tp, err = pmuKprobe(args)
+		}
+		if err == nil {
+			return tp, nil
+		}
+		if err != nil && !errors.Is(err, ErrNotSupported) {
+			return nil, fmt.Errorf("creating perf_kprobe PMU: %w", err)
+		}
+	} else {
+		args.maxActive = opts.MaxActive
 	}
 
 	// Use tracefs if kprobe PMU is missing.
 	args.symbol = symbol
-	tp, err = tracefsKprobe(args)
+	tp, err := tracefsKprobe(args)
 	if errors.Is(err, os.ErrNotExist) {
 		args.symbol = platformPrefix(symbol)
 		tp, err = tracefsKprobe(args)
@@ -438,7 +444,11 @@ func createTraceFSProbeEvent(typ probeType, args probeArgs) error {
 		// the eBPF program itself.
 		// See Documentation/kprobes.txt for more details.
 		token = kprobeToken(args)
-		pe = fmt.Sprintf("%s:%s/%s %s", probePrefix(args.ret), args.group, sanitizeSymbol(args.symbol), token)
+		probePrefix := probePrefix(args.ret)
+		if args.maxActive > 0 {
+			probePrefix = fmt.Sprintf("%s%d", probePrefix, args.maxActive)
+		}
+		pe = fmt.Sprintf("%s:%s/%s %s", probePrefix, args.group, sanitizeSymbol(args.symbol), token)
 	case uprobeType:
 		// The uprobe_events syntax is as follows:
 		// p[:[GRP/]EVENT] PATH:OFFSET [FETCHARGS] : Set a probe
@@ -565,4 +575,15 @@ func kprobeToken(args probeArgs) string {
 	}
 
 	return po
+}
+
+func shouldAttachToPmuProbe(ret bool, opts *KprobeOptions) bool {
+	// if return probe & opt
+	if ret && opts != nil && opts.MaxActive > 0 {
+		numCPU, err := internal.PossibleCPUs()
+		if err != nil || numCPU < opts.MaxActive {
+			return false
+		}
+	}
+	return true
 }
